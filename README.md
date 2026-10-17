@@ -62,7 +62,7 @@ Dufs 可以把任意目录变成一个网页文件服务器：浏览器里直接
 - 访客可见范围设置：仅公开目录 / 全站只读 / 完全禁止
 - HTTPS 支持
 - WebDAV 支持
-- 可通过 Docker、二进制文件或 Cargo 安装
+- 推荐 Docker 部署：多架构镜像开箱即用
 
 ## Docker 快速开始
 
@@ -134,13 +134,11 @@ docker run --rm -p 5000:5000 -v "$PWD:/data" dufs:v1.2.0 \
 - 上传的 HTML/SVG 文件会按原类型内联展示（方便托管静态页面）。如果访客可以匿名上传，请注意存储型 XSS 的风险：要么关闭匿名上传，要么不要在同一浏览器里用管理员身份浏览不受信任的上传内容。
 - 对公网提供服务的额外建议：开启 HTTPS（`--tls-cert` / `--tls-key`，会话 Cookie 会自动附加 `Secure`）、限制 `--bind` 地址、按需收紧 `-A` 权限。
 
-## 安装方式
+## 部署方式
 
-**Docker**（推荐）：见上文，或自行构建 `docker build -t dufs .`
+**推荐使用 Docker 部署**：见上文「[Docker 快速开始](#docker-快速开始)」，镜像包从 [Releases](https://github.com/aisubing/dufs-fileserver/releases) 下载，或自行构建 `docker build -t dufs .`。
 
-**二进制**：在 [Releases](https://github.com/aisubing/dufs-fileserver/releases) 下载对应平台的压缩包（打 `v*` tag 后由 CI 自动构建）
-
-**Cargo**：
+备选：源码编译（需要 Rust 工具链）：
 
 ```
 cargo install --path .
