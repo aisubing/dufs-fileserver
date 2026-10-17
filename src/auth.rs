@@ -1,0 +1,1003 @@
+use crate::{args::Args, server::Response, utils::unix_now};
+
+use anyhow::{anyhow, bail, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use ed25519_dalek::{ed25519::signature::SignerMut, Signature, SigningKey};
+use headers::HeaderValue;
+use hyper::{header::WWW_AUTHENTICATE, Method};
+use indexmap::IndexMap;
+use lazy_static::lazy_static;
+use md5::Context;
+use sha2::{Digest, Sha256};
+use sha_crypt::PasswordVerifier;
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
+use tokio::fs;
+use uuid::Uuid;
+
+const REALM: &str = "DUFS";
+const DIGEST_AUTH_TIMEOUT: u32 = 60 * 60 * 24 * 7; // 7 days
+const TOKEN_EXPIRATION: u64 = 1000 * 60 * 60 * 24 * 3; // 3 days
+/// 鉴权规则路径的最大深度。权限树是递归构建和遍历的，
+/// 过深的规则可能触发栈溢出（`panic = "abort"` 下会直接杀死进程）。
+const MAX_ACCESS_PATH_DEPTH: usize = 128;
+
+/// 会话 Cookie 有效期（秒）：7 天
+pub const SESSION_TOKEN_EXPIRATION_SECS: u64 = 60 * 60 * 24 * 7;
+
+lazy_static! {
+    static ref NONCESTARTHASH: Context = {
+        let mut h = Context::new();
+        h.consume(Uuid::new_v4().as_bytes());
+        h.consume(std::process::id().to_be_bytes());
+        h
+    };
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessControl {
+    empty: bool,
+    use_hashed_password: bool,
+    users: IndexMap<String, (String, AccessPaths)>,
+    anonymous: Option<AccessPaths>,
+}
+
+impl Default for AccessControl {
+    fn default() -> Self {
+        AccessControl {
+            empty: true,
+            use_hashed_password: false,
+            users: IndexMap::new(),
+            anonymous: Some(AccessPaths::new(AccessPerm::ReadWrite)),
+        }
+    }
+}
+
+impl AccessControl {
+    pub fn new(raw_rules: &[&str]) -> Result<Self> {
+        if raw_rules.is_empty() {
+            return Ok(Self::default());
+        }
+        let new_raw_rules = split_rules(raw_rules);
+        let mut use_hashed_password = false;
+        let mut annoy_paths = None;
+        let mut account_paths_pairs = vec![];
+        for rule in &new_raw_rules {
+            let (account, paths) =
+                split_account_paths(rule).ok_or_else(|| anyhow!("Invalid auth `{rule}`"))?;
+            if account.is_empty() {
+                if annoy_paths.is_some() {
+                    bail!("Invalid auth, no duplicate anonymous rules");
+                }
+                annoy_paths = Some(paths)
+            } else if let Some((user, pass)) = account.split_once(':') {
+                if user.is_empty() || pass.is_empty() {
+                    bail!("Invalid auth `{rule}`");
+                }
+                account_paths_pairs.push((user, pass, paths));
+            }
+        }
+        let mut anonymous = None;
+        if let Some(paths) = annoy_paths {
+            let mut access_paths = AccessPaths::default();
+            access_paths
+                .merge(paths)
+                .ok_or_else(|| anyhow!("Invalid auth value `@{paths}"))?;
+            anonymous = Some(access_paths);
+        }
+        let mut users = IndexMap::new();
+        for (user, pass, paths) in account_paths_pairs.into_iter() {
+            let mut access_paths = AccessPaths::default();
+            access_paths
+                .merge(paths)
+                .ok_or_else(|| anyhow!("Invalid auth value `{user}:{pass}@{paths}"))?;
+            if let Some(anon_ap) = &anonymous {
+                let orig_user = access_paths.clone();
+                access_paths.absorb_anon(
+                    anon_ap,
+                    &orig_user,
+                    AccessPerm::IndexOnly,
+                    AccessPerm::IndexOnly,
+                );
+            }
+            if pass.starts_with("$6$") {
+                use_hashed_password = true;
+            }
+            users.insert(user.to_string(), (pass.to_string(), access_paths));
+        }
+
+        Ok(Self {
+            empty: false,
+            use_hashed_password,
+            users,
+            anonymous,
+        })
+    }
+
+    pub fn has_users(&self) -> bool {
+        !self.users.is_empty()
+    }
+
+    /// 是否处于「匿名只能访问部分子目录」模式：
+    /// 匿名对根路径仅有索引权限，且存在被授权的子目录（例如 @/public）
+    pub fn anonymous_root_is_index_only(&self) -> bool {
+        match &self.anonymous {
+            Some(paths) => paths.perm().indexonly() && !paths.child_names().is_empty(),
+            None => false,
+        }
+    }
+
+    /// 返回鉴权结果 `(user, access_paths, via_token)`。
+    /// `via_token` 仅在身份由分享 token（而非账号凭据或匿名规则）建立时为 true。
+    /// `root` 为服务目录，用于识别配置名的文件系统别名（大小写变体等）。
+    pub async fn guard(
+        &self,
+        path: &str,
+        method: &Method,
+        authorization: Option<&HeaderValue>,
+        token: Option<&String>,
+        guard_options: bool,
+        root: &Path,
+    ) -> (Option<String>, Option<AccessPaths>, bool) {
+        if self.empty {
+            return (None, Some(AccessPaths::new(AccessPerm::ReadWrite)), false);
+        }
+
+        if method == Method::GET {
+            if let Some(token) = token {
+                if let Ok((user, ap)) = self.verify_token(token, path) {
+                    return (Some(user), ap.guard(path, method, Some(root)).await, true);
+                }
+            }
+        }
+
+        if let Some(authorization) = authorization {
+            if let Some(user) = get_auth_user(authorization) {
+                if let Some((pass, ap)) = self.users.get(&user) {
+                    if check_auth(authorization, method.as_str(), &user, pass).is_some() {
+                        if method == Method::OPTIONS {
+                            return (
+                                Some(user),
+                                Some(AccessPaths::new(AccessPerm::ReadOnly)),
+                                false,
+                            );
+                        }
+                        return (Some(user), ap.guard(path, method, Some(root)).await, false);
+                    }
+                }
+            }
+
+            return (None, None, false);
+        }
+
+        if !guard_options && method == Method::OPTIONS {
+            return (None, Some(AccessPaths::new(AccessPerm::ReadOnly)), false);
+        }
+
+        if let Some(ap) = self.anonymous.as_ref() {
+            return (None, ap.guard(path, method, Some(root)).await, false);
+        }
+
+        (None, None, false)
+    }
+
+    pub fn generate_token(&self, path: &str, user: &str) -> Result<String> {
+        let (pass, _) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+        let exp = (unix_now().as_millis() as u64).saturating_add(TOKEN_EXPIRATION);
+        let message = format!("{path}:{exp}");
+        let mut signing_key = derive_secret_key(user, pass);
+        let sig = signing_key.sign(message.as_bytes()).to_bytes();
+
+        let mut raw = Vec::with_capacity(64 + 8 + user.len());
+        raw.extend_from_slice(&sig);
+        raw.extend_from_slice(&exp.to_be_bytes());
+        raw.extend_from_slice(user.as_bytes());
+
+        Ok(hex::encode(raw))
+    }
+
+    /// 生成会话令牌（Cookie 登录用）：绑定用户与过期时间，不绑定具体路径
+    pub fn generate_session_token(&self, user: &str) -> Result<String> {
+        let (pass, _) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+        let exp = (unix_now().as_millis() as u64)
+            .saturating_add(SESSION_TOKEN_EXPIRATION_SECS.saturating_mul(1000));
+        let message = format!("session:{exp}");
+        let mut signing_key = derive_secret_key(user, pass);
+        let sig = signing_key.sign(message.as_bytes()).to_bytes();
+
+        let mut raw = Vec::with_capacity(64 + 8 + user.len());
+        raw.extend_from_slice(&sig);
+        raw.extend_from_slice(&exp.to_be_bytes());
+        raw.extend_from_slice(user.as_bytes());
+        Ok(hex::encode(raw))
+    }
+
+    /// 校验会话令牌，成功返回 (用户名, 权限)
+    pub fn verify_session_token(&self, token: &str) -> Option<(String, AccessPaths)> {
+        let raw = hex::decode(token).ok()?;
+        if raw.len() < 72 {
+            return None;
+        }
+        let sig_bytes = &raw[..64];
+        let exp_bytes = &raw[64..72];
+        let user_bytes = &raw[72..];
+        let exp = u64::from_be_bytes(exp_bytes.try_into().ok()?);
+        if unix_now().as_millis() as u64 > exp {
+            return None;
+        }
+        let user = std::str::from_utf8(user_bytes).ok()?;
+        let (pass, paths) = self.users.get(user)?;
+        let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes).ok()?);
+        let message = format!("session:{exp}");
+        derive_secret_key(user, pass)
+            .verify(message.as_bytes(), &sig)
+            .ok()?;
+        Some((user.to_string(), paths.clone()))
+    }
+
+    fn verify_token<'a>(&'a self, token: &str, path: &str) -> Result<(String, &'a AccessPaths)> {
+        let raw = hex::decode(token)?;
+
+        if raw.len() < 72 {
+            bail!("Invalid token");
+        }
+
+        let sig_bytes = &raw[..64];
+        let exp_bytes = &raw[64..72];
+        let user_bytes = &raw[72..];
+
+        let exp = u64::from_be_bytes(exp_bytes.try_into()?);
+        if unix_now().as_millis() as u64 > exp {
+            bail!("Token expired");
+        }
+
+        let user = std::str::from_utf8(user_bytes)?;
+        let (pass, ap) = self
+            .users
+            .get(user)
+            .ok_or_else(|| anyhow!("Not found user '{user}'"))?;
+
+        let sig = Signature::from_bytes(&<[u8; 64]>::try_from(sig_bytes)?);
+
+        let message = format!("{path}:{exp}");
+        derive_secret_key(user, pass).verify(message.as_bytes(), &sig)?;
+        Ok((user.to_string(), ap))
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AccessPaths {
+    perm: AccessPerm,
+    children: IndexMap<String, AccessPaths>,
+}
+
+impl AccessPaths {
+    pub fn new(perm: AccessPerm) -> Self {
+        Self {
+            perm,
+            ..Default::default()
+        }
+    }
+
+    pub fn perm(&self) -> AccessPerm {
+        self.perm
+    }
+
+    pub fn set_perm(&mut self, perm: AccessPerm) {
+        if !perm.indexonly() {
+            self.perm = perm;
+        }
+    }
+
+    pub fn merge(&mut self, paths: &str) -> Option<()> {
+        for item in paths.trim_matches(',').split(',') {
+            let (path, perm) = match item.split_once(':') {
+                None => (item, AccessPerm::ReadOnly),
+                Some((path, "ro")) => (path, AccessPerm::ReadOnly),
+                Some((path, "rw")) => (path, AccessPerm::ReadWrite),
+                _ => return None,
+            };
+            let trimmed = path.trim_matches('/');
+            if !trimmed.is_empty() && trimmed.split('/').count() > MAX_ACCESS_PATH_DEPTH {
+                return None;
+            }
+            self.add(path, perm);
+        }
+        Some(())
+    }
+
+    pub async fn guard(&self, path: &str, method: &Method, root: Option<&Path>) -> Option<Self> {
+        let target = self.find(path, root).await?;
+        if !is_readonly_method(method) && !target.perm().readwrite() {
+            return None;
+        }
+        Some(target)
+    }
+
+    fn add(&mut self, path: &str, perm: AccessPerm) {
+        let path = path.trim_matches('/');
+        if path.is_empty() {
+            self.set_perm(perm);
+        } else {
+            let parts: Vec<&str> = path.split('/').collect();
+            self.add_impl(&parts, perm);
+        }
+    }
+
+    fn add_impl(&mut self, parts: &[&str], perm: AccessPerm) {
+        if parts.is_empty() {
+            self.perm = perm;
+            return;
+        }
+        let child = self.children.entry(parts[0].to_string()).or_default();
+        child.add_impl(&parts[1..], perm)
+    }
+
+    /// Merge anonymous `AccessPaths` into `self` (a user's paths) with "higher perm wins" semantics.
+    /// `orig_user` is a snapshot of `self` before any anonymous merging begins, used so that
+    /// the user's own effective perm is measured against the pre-merge state.
+    fn absorb_anon(
+        &mut self,
+        anon: &AccessPaths,
+        orig_user: &AccessPaths,
+        user_inherited: AccessPerm,
+        anon_inherited: AccessPerm,
+    ) {
+        let anon_eff = if !anon.perm.indexonly() {
+            anon.perm
+        } else {
+            anon_inherited
+        };
+        let orig_user_eff = if !orig_user.perm.indexonly() {
+            orig_user.perm
+        } else {
+            user_inherited
+        };
+
+        let combined = std::cmp::max(anon_eff, orig_user_eff);
+        if !combined.indexonly() && combined > self.perm {
+            self.perm = combined;
+        }
+
+        let default_ap = AccessPaths::default();
+        for (name, anon_child) in &anon.children {
+            let orig_user_child = orig_user.children.get(name).unwrap_or(&default_ap);
+            let user_child = self.children.entry(name.clone()).or_default();
+            user_child.absorb_anon(anon_child, orig_user_child, orig_user_eff, anon_eff);
+        }
+    }
+
+    /// 将 `path` 对着权限树解析。
+    ///
+    /// `root` 是相对路径 `path` 对应的磁盘目录，用于识别配置名的文件系统别名：
+    /// 底层文件系统可能把多种拼写（大小写变体、NTFS 8.3 短名、NTFS 数据流等）
+    /// 解析到同一个对象。这类请求若按精确拼写回退到父级权限，会让受限的子规则
+    /// 失效；此处改为先识别别名再匹配对应规则。传 `None` 则退化为纯字符串匹配。
+    pub async fn find(&self, path: &str, root: Option<&Path>) -> Option<AccessPaths> {
+        let parts: Vec<&str> = path
+            .trim_matches('/')
+            .split('/')
+            .filter(|v| !v.is_empty())
+            .collect();
+        let mut perm = self.perm;
+        let mut paths = self;
+        for (i, name) in parts.iter().enumerate() {
+            let name = *name;
+            if !paths.perm.indexonly() {
+                perm = paths.perm;
+            }
+            let child = match paths.children.get(name) {
+                Some(child) => child,
+                None => match paths.find_alias(name, &parts[..i], root).await {
+                    Some(child) => child,
+                    None => {
+                        return if perm.indexonly() {
+                            None
+                        } else {
+                            Some(AccessPaths::new(perm))
+                        }
+                    }
+                },
+            };
+            paths = child;
+        }
+        if !paths.perm.indexonly() {
+            perm = paths.perm;
+        }
+        if perm.indexonly() {
+            Some(paths.clone())
+        } else {
+            Some(AccessPaths::new(perm))
+        }
+    }
+
+    /// 在已配置的子节点中寻找一个：其名称在文件系统里与 `name`（位于 `prefix`
+    /// 之下、相对于 `root`）解析为同一个对象。
+    async fn find_alias<'a>(
+        &'a self,
+        name: &str,
+        prefix: &[&str],
+        root: Option<&Path>,
+    ) -> Option<&'a AccessPaths> {
+        let root = root?;
+        // 便宜的预过滤：不存在疑似别名时完全不碰文件系统，精确请求走快速路径。
+        if !self.children.keys().any(|key| could_alias(name, key)) {
+            return None;
+        }
+        let name_ident = path_identity(root, prefix, name).await?;
+        // 身份信息里带 `name` 的磁盘真实拼写，拼不出来的子节点直接跳过，
+        // 无论一个规则下配了多少子节点，查找次数都有上界。
+        let real_name = name_ident.file_name().and_then(|v| v.to_str());
+        for (key, child) in &self.children {
+            if real_name.is_some_and(|real| !could_alias(real, key)) {
+                continue;
+            }
+            if path_identity(root, prefix, key)
+                .await
+                .is_some_and(|v| v == name_ident)
+            {
+                return Some(child);
+            }
+        }
+        None
+    }
+
+    pub fn child_names(&self) -> Vec<&String> {
+        self.children.keys().collect()
+    }
+
+    pub fn entry_paths(&self, base: &Path) -> Vec<PathBuf> {
+        if !self.perm().indexonly() {
+            return vec![base.to_path_buf()];
+        }
+        let mut output = vec![];
+        self.entry_paths_impl(&mut output, base);
+        output
+    }
+
+    fn entry_paths_impl(&self, output: &mut Vec<PathBuf>, base: &Path) {
+        for (name, child) in self.children.iter() {
+            let base = base.join(name);
+            if child.perm().indexonly() {
+                child.entry_paths_impl(output, &base);
+            } else {
+                output.push(base)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum AccessPerm {
+    #[default]
+    IndexOnly,
+    ReadOnly,
+    ReadWrite,
+}
+
+impl AccessPerm {
+    pub fn indexonly(&self) -> bool {
+        self == &AccessPerm::IndexOnly
+    }
+
+    pub fn readwrite(&self) -> bool {
+        self == &AccessPerm::ReadWrite
+    }
+}
+
+pub fn www_authenticate(res: &mut Response, args: &Args) -> Result<()> {
+    if args.auth.use_hashed_password {
+        let basic = HeaderValue::from_str(&format!("Basic realm=\"{REALM}\""))?;
+        res.headers_mut().insert(WWW_AUTHENTICATE, basic);
+    } else {
+        let nonce = create_nonce()?;
+        let digest = HeaderValue::from_str(&format!(
+            "Digest realm=\"{REALM}\", nonce=\"{nonce}\", qop=\"auth\""
+        ))?;
+        let basic = HeaderValue::from_str(&format!("Basic realm=\"{REALM}\""))?;
+        res.headers_mut().append(WWW_AUTHENTICATE, digest);
+        res.headers_mut().append(WWW_AUTHENTICATE, basic);
+    }
+    Ok(())
+}
+
+pub fn get_auth_user(authorization: &HeaderValue) -> Option<String> {
+    if let Some(value) = strip_prefix(authorization.as_bytes(), b"Basic ") {
+        let value: Vec<u8> = STANDARD.decode(value).ok()?;
+        let parts: Vec<&str> = std::str::from_utf8(&value).ok()?.split(':').collect();
+        Some(parts[0].to_string())
+    } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
+        let digest_map = to_headermap(value).ok()?;
+        let username = digest_map.get(b"username".as_ref())?;
+        std::str::from_utf8(username).map(|v| v.to_string()).ok()
+    } else {
+        None
+    }
+}
+
+pub fn check_auth(
+    authorization: &HeaderValue,
+    method: &str,
+    auth_user: &str,
+    auth_pass: &str,
+) -> Option<()> {
+    if let Some(value) = strip_prefix(authorization.as_bytes(), b"Basic ") {
+        let value: Vec<u8> = STANDARD.decode(value).ok()?;
+        let (user, pass) = std::str::from_utf8(&value).ok()?.split_once(':')?;
+
+        if user != auth_user {
+            return None;
+        }
+
+        if auth_pass.starts_with("$6$") {
+            if sha_crypt::ShaCrypt::SHA512
+                .verify_password(pass.as_bytes(), auth_pass)
+                .is_ok()
+            {
+                return Some(());
+            }
+        } else if constant_time_eq(pass, auth_pass) {
+            return Some(());
+        }
+
+        None
+    } else if let Some(value) = strip_prefix(authorization.as_bytes(), b"Digest ") {
+        let digest_map = to_headermap(value).ok()?;
+        if let (Some(username), Some(nonce), Some(user_response)) = (
+            digest_map
+                .get(b"username".as_ref())
+                .and_then(|b| std::str::from_utf8(b).ok()),
+            digest_map.get(b"nonce".as_ref()),
+            digest_map.get(b"response".as_ref()),
+        ) {
+            match validate_nonce(nonce) {
+                Ok(true) => {}
+                _ => return None,
+            }
+            if auth_user != username {
+                return None;
+            }
+
+            let mut h = Context::new();
+            h.consume(format!("{auth_user}:{REALM}:{auth_pass}").as_bytes());
+            let auth_pass = format!("{:x}", h.finalize());
+
+            let mut ha = Context::new();
+            ha.consume(method);
+            ha.consume(b":");
+            if let Some(uri) = digest_map.get(b"uri".as_ref()) {
+                ha.consume(uri);
+            }
+            let ha = format!("{:x}", ha.finalize());
+            let mut correct_response = None;
+            if let Some(qop) = digest_map.get(b"qop".as_ref()) {
+                if qop == &b"auth".as_ref() || qop == &b"auth-int".as_ref() {
+                    correct_response = Some({
+                        let mut c = Context::new();
+                        c.consume(&auth_pass);
+                        c.consume(b":");
+                        c.consume(nonce);
+                        c.consume(b":");
+                        if let Some(nc) = digest_map.get(b"nc".as_ref()) {
+                            c.consume(nc);
+                        }
+                        c.consume(b":");
+                        if let Some(cnonce) = digest_map.get(b"cnonce".as_ref()) {
+                            c.consume(cnonce);
+                        }
+                        c.consume(b":");
+                        c.consume(qop);
+                        c.consume(b":");
+                        c.consume(&*ha);
+                        format!("{:x}", c.finalize())
+                    });
+                }
+            }
+            let correct_response = match correct_response {
+                Some(r) => r,
+                None => {
+                    let mut c = Context::new();
+                    c.consume(&auth_pass);
+                    c.consume(b":");
+                    c.consume(nonce);
+                    c.consume(b":");
+                    c.consume(&*ha);
+                    format!("{:x}", c.finalize())
+                }
+            };
+            if correct_response.as_bytes() == *user_response {
+                return Some(());
+            }
+        }
+        None
+    } else {
+        None
+    }
+}
+
+fn derive_secret_key(user: &str, pass: &str) -> SigningKey {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{user}:{pass}").as_bytes());
+    let hash = hasher.finalize();
+    SigningKey::from_bytes(&hash.into())
+}
+
+/// 常量时间字符串比较：避免明文密码校验的时序侧信道。
+/// 长度差异允许泄露（攻击者本就控制输入长度），内容比较恒定耗时。
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+/// Check if a nonce is still valid.
+/// Return an error if it was never valid
+fn validate_nonce(nonce: &[u8]) -> Result<bool> {
+    if nonce.len() != 34 || !nonce.iter().all(u8::is_ascii_hexdigit) {
+        bail!("invalid nonce");
+    }
+    //parse hex
+    let n = std::str::from_utf8(nonce)?;
+    //get time
+    if let Ok(secs_nonce) = u32::from_str_radix(&n[..8], 16) {
+        //check time
+        let now = unix_now();
+        let secs_now = now.as_secs() as u32;
+
+        if let Some(dur) = secs_now.checked_sub(secs_nonce) {
+            //check hash
+            let mut h = NONCESTARTHASH.clone();
+            h.consume(secs_nonce.to_be_bytes());
+            let h = format!("{:x}", h.finalize());
+            if h[..26] == n[8..34] {
+                return Ok(dur < DIGEST_AUTH_TIMEOUT);
+            }
+        }
+    }
+    bail!("invalid nonce");
+}
+
+fn is_readonly_method(method: &Method) -> bool {
+    method == Method::GET
+        || method == Method::OPTIONS
+        || method == Method::HEAD
+        || method.as_str() == "PROPFIND"
+        || method.as_str() == "CHECKAUTH"
+        || method.as_str() == "LOGOUT"
+}
+
+/// 解析 `root/<prefix...>/<name>` 在磁盘上的真实身份（canonical path）。
+async fn path_identity(root: &Path, prefix: &[&str], name: &str) -> Option<PathBuf> {
+    let mut path = root.to_path_buf();
+    for part in prefix {
+        path.push(part);
+    }
+    path.push(name);
+    fs::canonicalize(path).await.ok()
+}
+
+/// `name` 是否可能是已配置子节点 `key` 的文件系统别名。
+fn could_alias(name: &str, key: &str) -> bool {
+    if !is_plain_name(name) || !is_plain_name(key) {
+        return true;
+    }
+    name.eq_ignore_ascii_case(key)
+}
+
+fn is_plain_name(name: &str) -> bool {
+    name.is_ascii()
+        && !name.contains(':')
+        && !name.contains('~')
+        && !name.ends_with('.')
+        && !name.ends_with(' ')
+}
+
+fn strip_prefix<'a>(search: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
+    let l = prefix.len();
+    if search.len() < l {
+        return None;
+    }
+    if &search[..l] == prefix {
+        Some(&search[l..])
+    } else {
+        None
+    }
+}
+
+fn to_headermap(header: &[u8]) -> Result<HashMap<&[u8], &[u8]>, ()> {
+    let mut sep = Vec::new();
+    let mut assign = Vec::new();
+    let mut i: usize = 0;
+    let mut esc = false;
+    for c in header {
+        match (c, esc) {
+            (b'=', false) => assign.push(i),
+            (b',', false) => sep.push(i),
+            (b'"', false) => esc = true,
+            (b'"', true) => esc = false,
+            _ => {}
+        }
+        i += 1;
+    }
+    sep.push(i);
+
+    i = 0;
+    let mut ret = HashMap::new();
+    for (&k, &a) in sep.iter().zip(assign.iter()) {
+        while header.get(i) == Some(&b' ') {
+            i += 1;
+        }
+        if a <= i || k <= 1 + a || k > header.len() {
+            //keys and values must contain one char
+            return Err(());
+        }
+        let key = &header[i..a];
+        let val = if header[1 + a] == b'"' && header[k - 1] == b'"' {
+            //escaped
+            if 2 + a > k - 1 {
+                return Err(());
+            }
+            &header[2 + a..k - 1]
+        } else {
+            //not escaped
+            &header[1 + a..k]
+        };
+        i = 1 + k;
+        ret.insert(key, val);
+    }
+    Ok(ret)
+}
+
+fn create_nonce() -> Result<String> {
+    let now = unix_now();
+    let secs = now.as_secs() as u32;
+    let mut h = NONCESTARTHASH.clone();
+    h.consume(secs.to_be_bytes());
+
+    let n = format!("{:08x}{:032x}", secs, h.finalize());
+    Ok(n[..34].to_string())
+}
+
+fn split_account_paths(s: &str) -> Option<(&str, &str)> {
+    let i = s.find("@/")?;
+    Some((&s[0..i], &s[i + 1..]))
+}
+
+fn split_rules(rules: &[&str]) -> Vec<String> {
+    let mut output = vec![];
+    for rule in rules {
+        let parts: Vec<&str> = rule.split('|').collect();
+        let mut rules_list = vec![];
+        let mut concated_part = String::new();
+        for (i, part) in parts.iter().enumerate() {
+            if part.contains("@/") {
+                concated_part.push_str(part);
+                let mut concated_part_tmp = String::new();
+                std::mem::swap(&mut concated_part_tmp, &mut concated_part);
+                rules_list.push(concated_part_tmp);
+                continue;
+            }
+            concated_part.push_str(part);
+            if i < parts.len() - 1 {
+                concated_part.push('|');
+            }
+        }
+        if !concated_part.is_empty() {
+            rules_list.push(concated_part)
+        }
+        output.extend(rules_list);
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_split_account_paths() {
+        assert_eq!(
+            split_account_paths("user:pass@/:rw"),
+            Some(("user:pass", "/:rw"))
+        );
+        assert_eq!(
+            split_account_paths("user:pass@@/:rw"),
+            Some(("user:pass@", "/:rw"))
+        );
+        assert_eq!(
+            split_account_paths("user:pass@1@/:rw"),
+            Some(("user:pass@1", "/:rw"))
+        );
+    }
+
+    #[test]
+    fn test_compact_split_rules() {
+        assert_eq!(
+            split_rules(&["user1:pass1@/:rw|user2:pass2@/:rw"]),
+            ["user1:pass1@/:rw", "user2:pass2@/:rw"]
+        );
+        assert_eq!(
+            split_rules(&["user1:pa|ss1@/:rw|user2:pa|ss2@/:rw"]),
+            ["user1:pa|ss1@/:rw", "user2:pa|ss2@/:rw"]
+        );
+        assert_eq!(
+            split_rules(&["user1:pa|ss1@/:rw|@/"]),
+            ["user1:pa|ss1@/:rw", "@/"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_access_paths() {
+        let mut paths = AccessPaths::default();
+        paths.add("/dir1", AccessPerm::ReadWrite);
+        paths.add("/dir2/dir21", AccessPerm::ReadWrite);
+        paths.add("/dir2/dir21/dir211", AccessPerm::ReadOnly);
+        paths.add("/dir2/dir22", AccessPerm::ReadOnly);
+        paths.add("/dir2/dir22/dir221", AccessPerm::ReadWrite);
+        paths.add("/dir2/dir23/dir231", AccessPerm::ReadWrite);
+        assert_eq!(
+            paths.entry_paths(Path::new("/tmp")),
+            [
+                "/tmp/dir1",
+                "/tmp/dir2/dir21",
+                "/tmp/dir2/dir22",
+                "/tmp/dir2/dir23/dir231",
+            ]
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            paths
+                .find("dir2", None)
+                .await
+                .map(|v| v.entry_paths(Path::new("/tmp/dir2"))),
+            Some(
+                [
+                    "/tmp/dir2/dir21",
+                    "/tmp/dir2/dir22",
+                    "/tmp/dir2/dir23/dir231"
+                ]
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+            )
+        );
+        assert_eq!(
+            paths.find("dir1/file", None).await,
+            Some(AccessPaths::new(AccessPerm::ReadWrite))
+        );
+        assert_eq!(
+            paths.find("dir2/dir21/file", None).await,
+            Some(AccessPaths::new(AccessPerm::ReadWrite))
+        );
+        assert_eq!(
+            paths.find("dir2/dir21/dir211/file", None).await,
+            Some(AccessPaths::new(AccessPerm::ReadOnly))
+        );
+        assert_eq!(
+            paths.find("dir2/dir22/file", None).await,
+            Some(AccessPaths::new(AccessPerm::ReadOnly))
+        );
+        assert_eq!(
+            paths.find("dir2/dir22/dir221/file", None).await,
+            Some(AccessPaths::new(AccessPerm::ReadWrite))
+        );
+        assert_eq!(paths.find("dir2/dir23/file", None).await, None);
+        assert_eq!(
+            paths.find("dir2/dir23//dir231/file", None).await,
+            Some(AccessPaths::new(AccessPerm::ReadWrite))
+        );
+    }
+
+    #[test]
+    fn test_could_alias() {
+        // 大小写变体与别名形状的名称需要文件系统来裁决
+        assert!(could_alias("TEST.TXT", "test.txt"));
+        assert!(could_alias("Dir1", "dir1"));
+        assert!(could_alias("test.txt::$DATA", "test.txt"));
+        assert!(could_alias("test.txt.", "test.txt"));
+        assert!(could_alias("test.txt ", "test.txt"));
+        assert!(could_alias("SUPERS~1", "supersecretstorage"));
+        assert!(could_alias("supersecretstorage", "SUPERS~1"));
+        assert!(could_alias("café", "cafe\u{301}"));
+        // 除大小写外都不同的纯 ASCII 名称不可能是别名
+        assert!(!could_alias("other.txt", "test.txt"));
+        assert!(!could_alias("test.txt.bak", "test.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_find_alias() {
+        use assert_fs::prelude::*;
+        let dir = assert_fs::TempDir::new().unwrap();
+        dir.child("dir1/test.txt").write_str("x").unwrap();
+        dir.child("dir1/other.txt").write_str("x").unwrap();
+        dir.child("Protected/file.txt").write_str("x").unwrap();
+
+        let mut paths = AccessPaths::default();
+        paths.add("/", AccessPerm::ReadWrite);
+        paths.add("/dir1/test.txt", AccessPerm::ReadOnly);
+        paths.add("/Protected", AccessPerm::ReadOnly);
+
+        let root = Some(dir.path());
+        // 精确拼写
+        assert_eq!(
+            paths.find("dir1/test.txt", root).await,
+            Some(AccessPaths::new(AccessPerm::ReadOnly))
+        );
+        // 无关的同级文件继承父级权限
+        assert_eq!(
+            paths.find("dir1/other.txt", root).await,
+            Some(AccessPaths::new(AccessPerm::ReadWrite))
+        );
+
+        // 当文件系统本身折叠大小写时，配置名的别名解析到对应的规则
+        let folds_case = dir.path().join("DIR1").is_dir();
+        let protected = if folds_case {
+            Some(AccessPaths::new(AccessPerm::ReadOnly))
+        } else {
+            Some(AccessPaths::new(AccessPerm::ReadWrite))
+        };
+        assert_eq!(paths.find("dir1/TEST.TXT", root).await, protected);
+        assert_eq!(paths.find("DIR1/test.txt", root).await, protected);
+        assert_eq!(paths.find("PROTECTED/file.txt", root).await, protected);
+    }
+
+    #[test]
+    fn test_to_headermap() {
+        let map = to_headermap(br#"username="user", realm="DUFS", nonce="abc""#).unwrap();
+        assert_eq!(map.get(b"username".as_ref()), Some(&b"user".as_ref()));
+        assert_eq!(map.get(b"realm".as_ref()), Some(&b"DUFS".as_ref()));
+        assert_eq!(map.get(b"nonce".as_ref()), Some(&b"abc".as_ref()));
+    }
+
+    #[test]
+    fn test_to_headermap_malformed_no_panic() {
+        for header in [
+            &b"a=\""[..],
+            b"a==,",
+            b"a=",
+            b"=,",
+            b"a=\"b",
+            b"a=\"\"",
+            b"a=\"b\",",
+            b"a=\"b\" , c",
+            b" , =, \"",
+            b"",
+            b",",
+            b"\"",
+        ] {
+            // 必须不 panic；调用方把 Err 当作无效凭据处理
+            let _ = to_headermap(header);
+        }
+    }
+
+    #[test]
+    fn test_validate_nonce_no_panic() {
+        // 跨越第 8 字节边界的多字节 UTF-8 字符不能引发 panic
+        let mut nonce = b"0000000".to_vec();
+        nonce.extend_from_slice("é".as_bytes());
+        nonce.extend_from_slice(&[b'A'; 25]);
+        assert_eq!(nonce.len(), 34);
+        assert!(validate_nonce(&nonce).is_err());
+
+        assert!(validate_nonce(b"short").is_err());
+        assert!(validate_nonce(&[0xff; 34]).is_err());
+
+        // 新生成的 nonce 仍然有效
+        let nonce = create_nonce().unwrap();
+        assert!(matches!(validate_nonce(nonce.as_bytes()), Ok(true)));
+    }
+}

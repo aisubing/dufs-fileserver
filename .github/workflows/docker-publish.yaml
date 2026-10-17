@@ -1,0 +1,78 @@
+# 手动构建 Docker 镜像并发布到 GitHub Releases
+#
+# 使用方式：仓库页 → Actions → docker-publish → Run workflow
+#   - tag：目标 Release 的标签（如 v1.2.0），Release 不存在时会自动创建
+# 产物：dufs-docker-<架构>-<tag>.tar.gz（amd64 / arm64 各一份）
+# 加载方式：docker load -i dufs-docker-amd64-<tag>.tar.gz
+# 加载后镜像名为 dufs:<tag>，例如 dufs:v1.2.0
+name: docker-publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "目标 Release 标签（如 v1.2.0）"
+        required: true
+        default: "v1.2.0"
+      prerelease:
+        description: "标记为预发布（pre-release）"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-upload:
+    name: Build & Upload
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 构建阶段使用 rust-musl-cross 交叉编译（宿主固定 amd64），
+      # 无需 QEMU 模拟；仅在最终 scratch 阶段选择目标架构
+      - name: Build image (linux/amd64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          outputs: type=docker,dest=/tmp/dufs-amd64.tar
+          tags: dufs:${{ inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            DUFS_BUILD_ID=${{ github.run_number }}
+
+      - name: Build image (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          outputs: type=docker,dest=/tmp/dufs-arm64.tar
+          tags: dufs:${{ inputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            DUFS_BUILD_ID=${{ github.run_number }}
+
+      - name: Package images
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          mkdir -p dist
+          gzip -c /tmp/dufs-amd64.tar > "dist/dufs-docker-amd64-${TAG}.tar.gz"
+          gzip -c /tmp/dufs-arm64.tar > "dist/dufs-docker-arm64-${TAG}.tar.gz"
+          ls -lh dist
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          files: dist/*
+          prerelease: ${{ inputs.prerelease }}

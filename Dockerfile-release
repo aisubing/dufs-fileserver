@@ -1,0 +1,25 @@
+FROM alpine as builder
+ARG REPO VER TARGETPLATFORM
+RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \ 
+        TARGET="x86_64-unknown-linux-musl"; \
+    elif [  "$TARGETPLATFORM" = "linux/arm64" ]; then \
+        TARGET="aarch64-unknown-linux-musl"; \
+    elif [  "$TARGETPLATFORM" = "linux/arm/v7" ]; then \
+        TARGET="armv7-unknown-linux-musleabihf"; \
+    fi && \
+    wget https://github.com/${REPO}/releases/download/${VER}/dufs-${VER}-${TARGET}.tar.gz && \
+    tar -xf dufs-${VER}-${TARGET}.tar.gz && \
+    mv dufs /bin/
+
+FROM scratch
+COPY --from=builder /bin/dufs /bin/dufs
+STOPSIGNAL SIGINT
+
+# 与 Dockerfile 保持一致：Docker 面板可自动识别端口与存储映射
+EXPOSE 5000
+VOLUME /data
+WORKDIR /data
+
+ENTRYPOINT ["/bin/dufs"]
+# 配置与文件完全分离：/data/files 为分享根，/data/config 存管理员配置
+CMD ["/data/files", "--config-dir", "/data/config", "-A"]
